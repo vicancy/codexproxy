@@ -15,6 +15,7 @@ Environment="PATH=__NODE_BIN_DIR__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr
 Environment=NODE_BIN=/root/.nvm/versions/node/v22.22.0/bin/node
 Environment=LISTEN_HOST=127.0.0.1
 Environment=LISTEN_PORT=17777
+Environment=UPSTREAM_PROVIDER=azure
 Environment=UPSTREAM_AOAI_BASE_URL=https://pmagent2.openai.azure.com/openai/v1
 Environment=AZURE_OPENAI_SCOPE=https://cognitiveservices.azure.com/.default
 Environment=TOKEN_REFRESH_BUFFER_MS=300000
@@ -23,7 +24,7 @@ Environment=UPSTREAM_BODY_TIMEOUT_MS=600000
 EnvironmentFile=-/etc/default/codexproxy
 
 ExecStartPre=/bin/bash -lc 'test -x "${NODE_BIN}"'
-ExecStartPre=/bin/bash -lc 'command -v az >/dev/null'
+ExecStartPre=/bin/bash -lc 'if [ "${UPSTREAM_PROVIDER}" = azure ]; then command -v az >/dev/null; fi'
 ExecStart=/bin/bash -lc 'exec "${NODE_BIN}" "__PROJECT_DIR__/src/index.js"'
 
 Restart=always

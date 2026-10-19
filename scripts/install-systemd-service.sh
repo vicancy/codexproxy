@@ -6,6 +6,19 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+COPILOT_TRANSPORT_OVERRIDE=""
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    --copilot-transport=direct) COPILOT_TRANSPORT_OVERRIDE="direct" ;;
+    --copilot-transport=bridge) COPILOT_TRANSPORT_OVERRIDE="bridge" ;;
+    *) echo "Usage: $0 [--copilot-transport=direct|bridge]"; exit 1 ;;
+  esac
+  if [[ $# -ne 1 ]]; then
+    echo "Usage: $0 [--copilot-transport=direct|bridge]"
+    exit 1
+  fi
+fi
+
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_SRC="${PROJECT_DIR}/deploy/codexproxy.service"
 SERVICE_DEST="/etc/systemd/system/codexproxy.service"
@@ -75,6 +88,14 @@ else
   fi
 fi
 
+if [[ -n "${COPILOT_TRANSPORT_OVERRIDE}" ]]; then
+  if grep -q "^COPILOT_TRANSPORT=" "${ENV_DEST}"; then
+    sed -i "s|^COPILOT_TRANSPORT=.*|COPILOT_TRANSPORT=${COPILOT_TRANSPORT_OVERRIDE}|" "${ENV_DEST}"
+  else
+    echo "COPILOT_TRANSPORT=${COPILOT_TRANSPORT_OVERRIDE}" >> "${ENV_DEST}"
+  fi
+fi
+
 if grep -q '^COPILOT_PROXY_API_KEY=.' "${ENV_DEST}"; then
   chmod 0600 "${ENV_DEST}"
 fi
@@ -85,5 +106,5 @@ systemctl restart codexproxy.service
 
 echo
 echo "Service enabled and started."
-echo "GitHub Copilot bridge unit installed but not enabled; authenticate first, then enable it if needed."
+echo "Bridge unit installed; this script does not enable, disable, start, or stop the bridge."
 systemctl --no-pager --full status codexproxy.service | sed -n '1,20p'

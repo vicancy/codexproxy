@@ -8,7 +8,9 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test",
-    "usage": "node scripts/usage-report.mjs"
+    "usage": "node scripts/usage-report.mjs",
+    "copilot:login": "node scripts/copilot-login.mjs",
+    "copilot:verify": "node scripts/verify-copilot.mjs"
   },
   "dependencies": {
     "@azure/identity": "^4.13.0",

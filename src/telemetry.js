@@ -1,12 +1,14 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { StringDecoder } from "node:string_decoder";
+import { inspectRequest } from "./request-diagnostics.js";
 
 // Observation is bounded and never changes forwarded request/response bytes.
 const OBSERVATION_LIMIT = 4 * 1024 * 1024;
 const numeric = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
 const identifier = value => typeof value === "string" && /^[a-zA-Z0-9_.:/-]{1,160}$/.test(value) ? value : null;
 const effort = value => ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(value) ? value : null;
+const uuid = value => typeof value === "string" && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(value) ? value : null;
 const headerNames = [
   "x-request-id", "apim-request-id", "x-ms-request-id", "x-ms-region",
   "x-ratelimit-limit-requests", "x-ratelimit-limit-tokens",
@@ -42,19 +44,64 @@ function summarizeError(error) {
     : /provisioned|throughput unit/i.test(message) ? "provisioned_throughput"
     : /request.{0,20}rate|requests per min|\bRPM\b/i.test(message) ? "requests"
     : /rate.limit|429/i.test(`${code} ${type} ${message}`) ? "unspecified" : null;
-  return { code, type, limit_kind: limitKind };
+  const param = typeof error.param === "string" && /^[a-zA-Z_][\w.[\]-]{0,159}$/.test(error.param) ? error.param : null;
+  return { code, type, param, message_present: message.length > 0, limit_kind: limitKind };
 }
 
-export function createTelemetry(req, logger, { limit = OBSERVATION_LIMIT, provider = "azure" } = {}) {
+function summarizeTypedItems(items) {
+  const types = new Map();
+  const fieldsByType = new Map();
+  for (const item of items) {
+    const candidate = identifier(item?.type ?? item?.role) ?? "other";
+    const type = types.has(candidate) || types.size < 32 ? candidate : "other";
+    types.set(type, (types.get(type) ?? 0) + 1);
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const fields = fieldsByType.get(type) ?? new Set();
+      for (const key of Object.keys(item).slice(0, 32)) {
+        if (/^[\w.-]{1,80}$/.test(key)) fields.add(key);
+      }
+      fieldsByType.set(type, fields);
+    }
+  }
+  return {
+    count: items.length,
+    types: Object.fromEntries([...types].sort(([a], [b]) => a.localeCompare(b))),
+    fields_by_type: Object.fromEntries([...fieldsByType]
+      .map(([type, fields]) => [type, [...fields].sort().slice(0, 32)]))
+  };
+}
+
+function summarizeRequestShape(payload) {
+  const fields = payload && typeof payload === "object" && !Array.isArray(payload) ? Object.keys(payload) : [];
+  const input = Array.isArray(payload?.input) ? payload.input
+    : Array.isArray(payload?.messages) ? payload.messages : null;
+  const tools = Array.isArray(payload?.tools) ? payload.tools : null;
+  const contentParts = input?.flatMap(item => Array.isArray(item?.content) ? item.content : []) ?? [];
+  return {
+    top_level_fields: fields.filter(key => /^[\w.-]{1,80}$/.test(key)).sort().slice(0, 64),
+    input_kind: typeof payload?.input === "string" ? "string" : input ? "array" : "other",
+    ...(input ? { input: summarizeTypedItems(input), content_parts: summarizeTypedItems(contentParts) } : {}),
+    ...(tools ? { tools: summarizeTypedItems(tools) } : {}),
+    ...(payload?.reasoning && typeof payload.reasoning === "object" && !Array.isArray(payload.reasoning)
+      ? { reasoning_fields: Object.keys(payload.reasoning).filter(key => /^[\w.-]{1,80}$/.test(key)).sort().slice(0, 32) }
+      : {})
+  };
+}
+
+export function createTelemetry(req, logger, { limit = OBSERVATION_LIMIT, provider = "azure", transport } = {}) {
   const started = performance.now();
   const common = { provider, request_id: randomUUID(), started_at: new Date().toISOString(), method: req.method,
-    path: req.url.split("?")[0] };
+    path: req.url.split("?")[0], ...(transport ? { transport } : {}),
+    client_session_id: uuid(req.headers?.session_id ?? req.headers?.["x-codex-session-id"]),
+    client_request_id: uuid(req.headers?.["x-client-request-id"] ?? req.headers?.["x-request-id"]) };
   const request = { model: null, stream: null, requested_reasoning_effort: null, reasoning_effort: null,
     max_output_tokens: null, max_completion_tokens: null, max_tokens: null, input_items: null, tool_count: null,
     body_bytes: 0, forwarded_body_bytes: 0, metadata_status: "not_observed" };
   const response = { status_code: null, model: null, response_id: null, status: null, bytes: 0,
     headers_ms: null, first_byte_ms: null, rate_limits: {}, usage: null, error: null,
-    observation: "not_started" };
+    content_type: null, event_counts: {}, observation: "not_started" };
+  let requestShape = null, forwardedShape = null, requestDiagnostics = null;
+  let stage = "request", originalHash = null, forwardedHash = null, clientStatus = null;
   let ended = false, terminal = false, parser;
   const emit = (event, severity = "info", extra = {}) => {
     // A failing diagnostics sink must not fail inference.
@@ -62,7 +109,13 @@ export function createTelemetry(req, logger, { limit = OBSERVATION_LIMIT, provid
   };
   emit("request.started");
 
-  function requestPayload(payload, bytes) {
+  function requestBody(body) {
+    request.body_bytes = request.forwarded_body_bytes = Buffer.byteLength(body);
+    request.metadata_status = "invalid_json";
+    originalHash = forwardedHash = hash(body);
+  }
+
+  function requestPayload(payload, bytes, body) {
     request.body_bytes = bytes;
     request.forwarded_body_bytes = bytes;
     request.metadata_status = "observed";
@@ -73,10 +126,18 @@ export function createTelemetry(req, logger, { limit = OBSERVATION_LIMIT, provid
     for (const field of ["max_output_tokens", "max_completion_tokens", "max_tokens"]) request[field] = numeric(payload?.[field]);
     request.input_items = Array.isArray(payload?.input) ? payload.input.length : Array.isArray(payload?.messages) ? payload.messages.length : null;
     request.tool_count = Array.isArray(payload?.tools) ? payload.tools.length : null;
+    request.conversation_key_sha256 = typeof payload?.prompt_cache_key === "string" && payload.prompt_cache_key.length <= 1024
+      ? hash(payload.prompt_cache_key) : null;
+    requestShape = provider === "github-copilot" ? summarizeRequestShape(payload) : null;
+    requestDiagnostics = provider === "github-copilot" && payload && typeof payload === "object" && !Array.isArray(payload)
+      ? inspectRequest(payload) : null;
+    if (body !== undefined) originalHash = forwardedHash = hash(body);
   }
-  function forwardedPayload(payload, bytes) {
+  function forwardedPayload(payload, bytes, body) {
     request.reasoning_effort = effort(payload?.reasoning?.effort ?? payload?.reasoning_effort);
     request.forwarded_body_bytes = bytes;
+    forwardedShape = provider === "github-copilot" ? summarizeRequestShape(payload) : null;
+    if (body !== undefined) forwardedHash = hash(body);
   }
   async function* observeRequest(body, inspect) {
     let chunks = [], bytes = 0;
@@ -89,12 +150,20 @@ export function createTelemetry(req, logger, { limit = OBSERVATION_LIMIT, provid
     }
     request.metadata_status = !inspect ? "unsupported_body" : bytes > limit ? "size_limit" : "invalid_json";
     if (inspect && bytes <= limit) {
-      try { requestPayload(JSON.parse(Buffer.concat(chunks).toString("utf8")), bytes); } catch { /* passthrough */ }
+      try {
+        const body = Buffer.concat(chunks);
+        requestPayload(JSON.parse(body.toString("utf8")), bytes, body);
+      } catch { /* passthrough */ }
     }
   }
   function observePayload(payload, eventName) {
     if (!payload || typeof payload !== "object") return;
     const event = payload.type ?? eventName;
+    const knownEvents = ["response.created", "response.in_progress", "response.completed", "response.failed",
+      "response.incomplete", "response.cancelled", "response.output_item.added", "response.output_item.done",
+      "response.output_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "error"];
+    const eventKey = knownEvents.includes(event) ? event : "other";
+    response.event_counts[eventKey] = (response.event_counts[eventKey] ?? 0) + 1;
     const value = payload.response ?? payload;
     response.model = identifier(value.model) ?? response.model;
     response.response_id = identifier(value.id) ?? response.response_id;
@@ -116,13 +185,17 @@ export function createTelemetry(req, logger, { limit = OBSERVATION_LIMIT, provid
       if (typeof value === "string" && value.length <= 256 && /^[\w.,: /+-]+$/.test(value)) response.rate_limits[name] = value;
     }
     const type = String(normalized["content-type"] ?? "").toLowerCase();
+    response.content_type = /^[\w.+/-]+(?:;\s*charset=[\w-]+)?$/.test(type) ? type : null;
     const encoding = String(normalized["content-encoding"] ?? "identity").toLowerCase();
-    const sse = type.includes("text/event-stream"), json = type.includes("json");
+    // Some upstream errors contain JSON but are labelled text/plain or omit a
+    // content type. Parse bounded error bodies without ever logging raw text.
+    const sse = type.includes("text/event-stream"), json = type.includes("json") || statusCode >= 400;
     response.observation = encoding !== "identity" ? "encoded_body" : sse || json ? "observing" : "unsupported_content_type";
     if (response.observation === "observing") parser = createResponseObserver({ sse, limit, payload: observePayload,
       problem: reason => { response.observation = reason; } });
     emit("response.headers", "info", { request: { ...request }, status_code: statusCode,
-      headers_ms: response.headers_ms, rate_limits: { ...response.rate_limits } });
+      headers_ms: response.headers_ms, rate_limits: { ...response.rate_limits },
+      ...(statusCode === 400 && requestShape ? { request_shape: requestShape } : {}) });
   }
   function chunk(value) {
     if (response.first_byte_ms === null) response.first_byte_ms = Math.round(performance.now() - started);
@@ -142,10 +215,32 @@ export function createTelemetry(req, logger, { limit = OBSERVATION_LIMIT, provid
     emit("request.completed", outcome.endsWith("error") || outcome === "stream_interrupted" ? "error" : "info", {
       request: { ...request }, response, outcome, duration_ms: Math.round(performance.now() - started),
       usage_available: response.usage !== null, client_disconnected: clientDisconnected,
+      client_status_code: clientStatus ?? response.status_code,
+      stage, error_origin: outcome === "request_error" ? "local_validation"
+        : outcome === "authentication_error" ? "authentication"
+        : outcome === "http_error" || outcome === "response_error" ? "upstream"
+        : outcome === "transport_error" ? "transport" : null,
+      request_body_sha256: originalHash, forwarded_body_sha256: forwardedHash,
+      ...(requestDiagnostics ? { request_diagnostics: requestDiagnostics } : {}),
+      ...(response.status_code === 400 && requestShape ? { request_shape: requestShape } : {}),
       ...(error ? { transport_error: { type: identifier(error.name), code: identifier(error.code) } } : {})
     });
   }
-  return { requestPayload, forwardedPayload, observeRequest, headers, chunk, finish };
+  function prepared(changes = []) {
+    emit("request.prepared", "info", { request: { ...request }, changes,
+      request_body_sha256: originalHash, forwarded_body_sha256: forwardedHash,
+      ...(requestShape ? { request_shape: requestShape, forwarded_shape: forwardedShape ?? requestShape,
+        request_diagnostics: requestDiagnostics } : {}) });
+  }
+  return { requestPayload, requestBody, forwardedPayload, observeRequest, headers, chunk, finish, prepared,
+    requestId: common.request_id,
+    localStatus(value) { clientStatus = value; },
+    stage(value) { stage = value; },
+    event(name, extra) { emit(name, "info", extra); } };
+}
+
+function hash(body) {
+  return createHash("sha256").update(body).digest("hex");
 }
 
 function createResponseObserver({ sse, limit, payload, problem }) {

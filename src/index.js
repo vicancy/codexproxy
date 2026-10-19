@@ -2,6 +2,8 @@ import { DefaultAzureCredential } from "@azure/identity";
 import { loadConfig } from "./config.js";
 import { TokenManager } from "./auth.js";
 import { createProxyServer } from "./proxy.js";
+import { CopilotTokenManager } from "./copilot-auth.js";
+import { createCopilotClient } from "./copilot.js";
 
 const config = loadConfig();
 
@@ -23,7 +25,10 @@ const tokenManager = config.upstreamProvider === "azure"
   })
   : null;
 
-const server = createProxyServer({ config, tokenManager, logger });
+const copilotClient = config.upstreamProvider === "github-copilot" && config.copilotTransport === "direct"
+  ? createCopilotClient({ config, tokenManager: new CopilotTokenManager({ tokenFile: config.copilotTokenFile, logger }) })
+  : null;
+const server = createProxyServer({ config, tokenManager, copilotClient, logger });
 
 server.listen(config.listenPort, config.listenHost, () => {
   logger.info(
@@ -31,7 +36,8 @@ server.listen(config.listenPort, config.listenHost, () => {
       listenHost: config.listenHost,
       listenPort: config.listenPort,
       upstreamProvider: config.upstreamProvider,
-      upstreamBaseUrl: config.upstreamBaseUrl,
+      upstreamBaseUrl: copilotClient?.baseUrl ?? config.upstreamBaseUrl,
+      ...(config.upstreamProvider === "github-copilot" ? { transport: config.copilotTransport } : {}),
       ...(config.upstreamProvider === "azure" ? { scope: config.scope } : {}),
       stickyHighModels: config.stickyHighModels
     },

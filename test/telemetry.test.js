@@ -43,6 +43,45 @@ test("request telemetry labels the selected upstream provider", () => {
   assert.equal(complete(records).provider, "github-copilot");
 });
 
+test("harness correlation only logs UUID headers and hashes conversation keys", () => {
+  const { records, logger } = collector();
+  const telemetry = createTelemetry({ method: "POST", url: "/openai/v1/responses",
+    headers: { session_id: "12345678-1234-1234-1234-123456789012", "x-request-id": "PRIVATE HEADER" } }, logger,
+  { provider: "github-copilot" });
+  telemetry.requestPayload({ input: "PRIVATE PROMPT", prompt_cache_key: "PRIVATE CONVERSATION" }, 100);
+  telemetry.finish();
+  const result = complete(records);
+  assert.equal(result.client_session_id, "12345678-1234-1234-1234-123456789012");
+  assert.equal(result.client_request_id, null);
+  assert.match(result.request.conversation_key_sha256, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(records), /PRIVATE/);
+});
+
+test("Copilot 400 diagnostics log request structure without request values", () => {
+  const { telemetry, records } = local({ provider: "github-copilot" });
+  telemetry.requestPayload({
+    model: "gpt-6-astra",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "PRIVATE PROMPT" }] },
+      { type: "function_call", name: "PRIVATE TOOL", arguments: "{\"secret\":\"PRIVATE ARGUMENTS\"}" }
+    ],
+    tools: [{ type: "function", name: "PRIVATE TOOL", parameters: { secret: "PRIVATE SCHEMA" } }],
+    reasoning: { effort: "high", summary: "PRIVATE SUMMARY" },
+    metadata: { secret: "PRIVATE METADATA" }
+  }, 761363);
+  telemetry.headers(400, { "content-type": "application/json" });
+  telemetry.finish();
+
+  const headers = records.find(record => record.event === "response.headers");
+  const completed = complete(records);
+  assert.deepEqual(headers.request_shape.top_level_fields, ["input", "metadata", "model", "reasoning", "tools"]);
+  assert.deepEqual(headers.request_shape.input.types, { function_call: 1, message: 1 });
+  assert.deepEqual(headers.request_shape.content_parts.types, { input_text: 1 });
+  assert.deepEqual(headers.request_shape.reasoning_fields, ["effort", "summary"]);
+  assert.deepEqual(completed.request_shape, headers.request_shape);
+  assert.doesNotMatch(JSON.stringify(records), /PRIVATE/);
+});
+
 test("fragmented CRLF SSE preserves token subsets, error privacy and one completion", () => {
   const { telemetry, records } = local();
   telemetry.requestPayload({ model: "gpt-6-astra", input: "PRIVATE PROMPT", stream: true, reasoning: { effort: "ultra" }, max_output_tokens: 4000, tools: [{ description: "PRIVATE TOOL" }] }, 500);
@@ -93,6 +132,21 @@ test("429 JSON distinguishes provisioned throughput and excludes raw errors", ()
   assert.equal(complete(records).outcome, "http_error");
   assert.equal(complete(records).response.error.limit_kind, "provisioned_throughput");
   assert.doesNotMatch(JSON.stringify(records), /SECRET/);
+});
+
+test("JSON errors labelled text/plain retain code and parameter but never echo messages", () => {
+  const { telemetry, records } = local({ provider: "github-copilot", transport: "direct" });
+  telemetry.headers(400, { "content-type": "text/plain; charset=utf-8" });
+  telemetry.chunk(JSON.stringify({ error: { code: "invalid_request_body", param: "input[3].content",
+    message: "PRIVATE PROMPT" } }));
+  telemetry.finish();
+  const result = complete(records);
+  assert.equal(result.response.error.code, "invalid_request_body");
+  assert.equal(result.response.error.param, "input[3].content");
+  assert.equal(result.response.error.message_present, true);
+  assert.equal(result.error_origin, "upstream");
+  assert.equal(result.response.observation, "complete");
+  assert.doesNotMatch(JSON.stringify(records), /PRIVATE/);
 });
 
 test("Chat usage chunks and non-stream JSON use the same field names without summing twice", () => {

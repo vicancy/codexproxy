@@ -26,22 +26,28 @@ export function loadConfig(env = process.env) {
   if (!["azure", "github-copilot"].includes(upstreamProvider)) {
     throw new Error(`Invalid UPSTREAM_PROVIDER: ${upstreamProvider}`);
   }
+  const copilotTransport = env.COPILOT_TRANSPORT ?? "bridge";
+  if (!["bridge", "direct"].includes(copilotTransport)) throw new Error("Invalid COPILOT_TRANSPORT");
+  const copilotAccountType = env.COPILOT_ACCOUNT_TYPE ?? "individual";
+  if (!["individual", "business", "enterprise"].includes(copilotAccountType)) throw new Error("Invalid COPILOT_ACCOUNT_TYPE");
 
   const listenHost = env.LISTEN_HOST ?? DEFAULTS.LISTEN_HOST;
   const listenPort = parsePositiveInt(env, "LISTEN_PORT", DEFAULTS.LISTEN_PORT);
 
-  const upstreamBaseUrl = upstreamProvider === "github-copilot"
-    ? env.COPILOT_PROXY_BASE_URL ?? DEFAULTS.COPILOT_PROXY_BASE_URL
+  const nativeCopilot = upstreamProvider === "github-copilot" && copilotTransport === "direct";
+  const upstreamBaseUrl = nativeCopilot
+    ? copilotAccountType === "individual" ? "https://api.githubcopilot.com" : `https://api.${copilotAccountType}.githubcopilot.com`
+    : upstreamProvider === "github-copilot" ? env.COPILOT_PROXY_BASE_URL ?? DEFAULTS.COPILOT_PROXY_BASE_URL
     : env.UPSTREAM_AOAI_BASE_URL ?? DEFAULTS.UPSTREAM_AOAI_BASE_URL;
   if (!/^https?:\/\//.test(upstreamBaseUrl)) {
     throw new Error(`${upstreamProvider === "github-copilot" ? "COPILOT_PROXY_BASE_URL" : "UPSTREAM_AOAI_BASE_URL"} must be an absolute URL, got: ${upstreamBaseUrl}`);
   }
-  if (upstreamProvider === "github-copilot" && new URL(upstreamBaseUrl).pathname.replace(/\/$/, "") !== "/v1") {
+  if (upstreamProvider === "github-copilot" && !nativeCopilot && new URL(upstreamBaseUrl).pathname.replace(/\/$/, "") !== "/v1") {
     throw new Error("COPILOT_PROXY_BASE_URL must end in /v1");
   }
 
   const copilotProxyApiKey = env.COPILOT_PROXY_API_KEY?.trim() ?? "";
-  if (upstreamProvider === "github-copilot" && !copilotProxyApiKey) {
+  if (upstreamProvider === "github-copilot" && copilotTransport === "bridge" && !copilotProxyApiKey) {
     throw new Error("COPILOT_PROXY_API_KEY must be set when UPSTREAM_PROVIDER=github-copilot");
   }
 
@@ -55,6 +61,9 @@ export function loadConfig(env = process.env) {
 
   return {
     upstreamProvider,
+    copilotTransport,
+    copilotAccountType,
+    copilotTokenFile: env.COPILOT_TOKEN_FILE || undefined,
     listenHost,
     listenPort,
     upstreamBaseUrl,

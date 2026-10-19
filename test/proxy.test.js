@@ -1,3 +1,4 @@
+import { gzipSync } from "node:zlib";
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -317,4 +318,42 @@ test("GitHub Copilot readiness returns 503 when the bridge cannot be reached", a
   assert.equal(ready.status, 503);
   assert.deepEqual(await ready.json(), { ok: false, provider: "github-copilot", error: "upstream_unavailable" });
   assert.equal(errors[0].provider, "github-copilot");
+});
+
+test("Responses SSE reconciles message IDs without changing text or corrupting compressed bodies", async t => {
+  const events = [
+    { type: "response.output_item.added", output_index: 0, item: { type: "message", id: "original-message-id" } },
+    { type: "response.output_text.delta", output_index: 0, item_id: "delta-id", delta: "一次回复" },
+    { type: "response.output_item.done", output_index: 0, item: { type: "message", id: "done-id", content: [{ type: "output_text", text: "一次回复" }] } }
+  ];
+  const raw = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+  const upstream = http.createServer((req, res) => {
+    const compressed = req.url.includes("compressed");
+    const body = compressed ? gzipSync(raw) : Buffer.from(raw);
+    res.setHeader("content-type", "text/event-stream");
+    res.setHeader("content-length", body.length);
+    if (compressed) res.setHeader("content-encoding", "gzip");
+    res.end(body);
+  });
+  const upstreamAddr = await listen(upstream);
+  const proxy = createProxyServer({
+    config: { upstreamBaseUrl: `http://127.0.0.1:${upstreamAddr.port}/openai/v1`, upstreamHeadersTimeoutMs: 5_000, upstreamBodyTimeoutMs: 5_000 },
+    tokenManager: { async getAccessToken() { return "token"; } },
+    logger: { info() {}, error() {} }
+  });
+  const proxyAddr = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream); });
+
+  const response = await fetch(`http://127.0.0.1:${proxyAddr.port}/openai/v1/responses`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-length"), null);
+  const received = (await response.text()).trim().split("\n\n").map(frame => JSON.parse(frame.slice(6)));
+  const expected = structuredClone(events);
+  expected[1].item_id = expected[0].item.id;
+  expected[2].item.id = expected[0].item.id;
+  assert.deepEqual(received, expected);
+
+  const compressed = await fetch(`http://127.0.0.1:${proxyAddr.port}/openai/v1/responses?compressed`);
+  assert.equal(compressed.headers.get("content-encoding"), "gzip");
+  assert.equal(await compressed.text(), raw);
 });
