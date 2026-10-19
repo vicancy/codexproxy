@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "WSL local proxy for Codex to Azure OpenAI using Entra ID",
+  "description": "WSL local proxy for Codex to Azure OpenAI or GitHub Copilot",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "usage": "node scripts/usage-report.mjs"
   },
   "dependencies": {
     "@azure/identity": "^4.13.0",

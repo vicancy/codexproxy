@@ -1,0 +1,33 @@
+[Unit]
+Description=GitHub Copilot bridge for Codex WSL Proxy (community project)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__PROJECT_OWNER__
+Group=__PROJECT_GROUP__
+WorkingDirectory=__PROJECT_DIR__
+
+Environment=HOME=__PROJECT_HOME__
+Environment="PATH=__NODE_BIN_DIR__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment=NODE_BIN=__NODE_BIN__
+EnvironmentFile=/etc/default/codexproxy
+
+ExecStartPre=/bin/bash -lc 'test -x "${NODE_BIN}"'
+ExecStartPre=/bin/bash -lc 'test -n "${COPILOT_PROXY_API_KEY}"'
+ExecStartPre=/bin/bash -lc 'test -x "__NODE_BIN_DIR__/npx"'
+ExecStart=/bin/bash -lc 'exec "__NODE_BIN_DIR__/npx" --yes --registry=https://packagefeedproxy.microsoft.io/npm/ --package=copilot-proxy-api@0.10.32 copilot-proxy-api start --port 4141 --api-key "${COPILOT_PROXY_API_KEY}"'
+
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=copilot-proxy-api
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

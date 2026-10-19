@@ -1,16 +1,17 @@
 [Unit]
-Description=Codex WSL Proxy for Azure OpenAI (Entra ID)
+Description=Codex WSL Proxy for Azure OpenAI or GitHub Copilot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-WorkingDirectory=/root/codexproxy
+User=__PROJECT_OWNER__
+Group=__PROJECT_GROUP__
+WorkingDirectory=__PROJECT_DIR__
 
 # Safe defaults. Override in /etc/default/codexproxy.
-Environment=HOME=/root
+Environment=HOME=__PROJECT_HOME__
+Environment="PATH=__NODE_BIN_DIR__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/mnt/c/Program Files/Microsoft SDKs/Azure/CLI2/wbin"
 Environment=NODE_BIN=/root/.nvm/versions/node/v22.22.0/bin/node
 Environment=LISTEN_HOST=127.0.0.1
 Environment=LISTEN_PORT=17777
@@ -22,7 +23,8 @@ Environment=UPSTREAM_BODY_TIMEOUT_MS=600000
 EnvironmentFile=-/etc/default/codexproxy
 
 ExecStartPre=/bin/bash -lc 'test -x "${NODE_BIN}"'
-ExecStart=/bin/bash -lc 'exec "${NODE_BIN}" /root/codexproxy/src/index.js'
+ExecStartPre=/bin/bash -lc 'command -v az >/dev/null'
+ExecStart=/bin/bash -lc 'exec "${NODE_BIN}" "__PROJECT_DIR__/src/index.js"'
 
 Restart=always
 RestartSec=3

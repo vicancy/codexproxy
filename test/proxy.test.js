@@ -201,8 +201,120 @@ test("streaming upstream failure after headers does not crash the proxy", async 
   assert.deepEqual(await health.json(), { ok: true });
 
   assert.equal(loggerErrors.length, 1);
-  assert.equal(loggerErrors[0].message, "Proxy request failed after response started");
-  assert.equal(loggerErrors[0].meta.error, "stream exploded");
+  assert.equal(loggerErrors[0].meta.event, "request.completed");
+  assert.equal(loggerErrors[0].meta.outcome, "transport_error");
+  assert.equal(loggerErrors[0].meta.transport_error.type, "Error");
+  assert.equal(loggerErrors[0].meta.usage_available, false);
 
   await close(proxy);
+});
+
+test("GitHub Copilot provider maps Codex routes to the Responses bridge and uses its local API key", async (t) => {
+  const captured = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    captured.push({
+      url: req.url,
+      authorization: req.headers.authorization,
+      apiKey: req.headers["api-key"],
+      headers: req.headers,
+      body: Buffer.concat(chunks).toString()
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamAddr = await listen(upstream);
+  const logs = [];
+  const proxy = createProxyServer({
+    config: {
+      upstreamProvider: "github-copilot",
+      upstreamBaseUrl: `http://127.0.0.1:${upstreamAddr.port}/v1`,
+      copilotProxyApiKey: "local-bridge-key",
+      stickyHighModels: ["gpt-6-astra"],
+      stickyHighMaxBodyBytes: 1024,
+      upstreamHeadersTimeoutMs: 5_000,
+      upstreamBodyTimeoutMs: 5_000
+    },
+    tokenManager: null,
+    logger: { info(meta) { logs.push(meta); }, error(meta) { logs.push(meta); } }
+  });
+  const proxyAddr = await listen(proxy);
+  t.after(async () => {
+    await close(proxy);
+    await close(upstream);
+  });
+
+  const ready = await fetch(`http://127.0.0.1:${proxyAddr.port}/readyz`);
+  assert.equal(ready.status, 200);
+  assert.deepEqual(await ready.json(), { ok: true, provider: "github-copilot", statusCode: 200 });
+
+  const response = await fetch(`http://127.0.0.1:${proxyAddr.port}/openai/v1/responses?trace=1`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "client-token", "api-key": "client-key" },
+    body: JSON.stringify({ model: "gpt-6-astra", input: "ping", reasoning: { effort: "medium" } })
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true });
+
+  assert.deepEqual(captured.map(({ url }) => url), ["/v1/models", "/v1/responses?trace=1"]);
+  assert.deepEqual(captured.map(({ authorization, apiKey }) => ({ authorization, apiKey })), [
+    { authorization: "Bearer local-bridge-key", apiKey: undefined },
+    { authorization: "Bearer local-bridge-key", apiKey: undefined }
+  ]);
+  assert.equal(JSON.parse(captured[1].body).reasoning.effort, "high");
+  assert.equal(Number(captured[1].headers["content-length"]), Buffer.byteLength(captured[1].body));
+  const completed = logs.findLast(record => record.event === "request.completed");
+  assert.equal(completed.provider, "github-copilot");
+  assert.equal(completed.request.reasoning_effort, "high");
+});
+
+test("GitHub Copilot readiness reports an unavailable or unauthorized bridge", async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+  });
+  const upstreamAddr = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamProvider: "github-copilot",
+      upstreamBaseUrl: `http://127.0.0.1:${upstreamAddr.port}/v1`,
+      copilotProxyApiKey: "",
+      upstreamHeadersTimeoutMs: 5_000,
+      upstreamBodyTimeoutMs: 5_000
+    },
+    tokenManager: null,
+    logger: { info() {}, error() {} }
+  });
+  const proxyAddr = await listen(proxy);
+  t.after(async () => {
+    await close(proxy);
+    await close(upstream);
+  });
+
+  const ready = await fetch(`http://127.0.0.1:${proxyAddr.port}/readyz`);
+  assert.equal(ready.status, 503);
+  assert.deepEqual(await ready.json(), { ok: false, provider: "github-copilot", statusCode: 401 });
+});
+
+test("GitHub Copilot readiness returns 503 when the bridge cannot be reached", async (t) => {
+  const errors = [];
+  const proxy = createProxyServer({
+    config: {
+      upstreamProvider: "github-copilot",
+      upstreamBaseUrl: "http://127.0.0.1:1/v1",
+      copilotProxyApiKey: "local-bridge-key",
+      upstreamHeadersTimeoutMs: 100,
+      upstreamBodyTimeoutMs: 100
+    },
+    tokenManager: null,
+    logger: { info() {}, error(meta) { errors.push(meta); } }
+  });
+  const proxyAddr = await listen(proxy);
+  t.after(() => close(proxy));
+
+  const ready = await fetch(`http://127.0.0.1:${proxyAddr.port}/readyz`);
+  assert.equal(ready.status, 503);
+  assert.deepEqual(await ready.json(), { ok: false, provider: "github-copilot", error: "upstream_unavailable" });
+  assert.equal(errors[0].provider, "github-copilot");
 });

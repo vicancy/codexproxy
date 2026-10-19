@@ -7,20 +7,21 @@ const config = loadConfig();
 
 const logger = {
   info(meta, message) {
-    console.log(JSON.stringify({ level: "info", message, ...meta }));
+    console.log(JSON.stringify({ timestamp: new Date().toISOString(), level: "info", message, ...meta }));
   },
   error(meta, message) {
-    console.error(JSON.stringify({ level: "error", message, ...meta }));
+    console.error(JSON.stringify({ timestamp: new Date().toISOString(), level: "error", message, ...meta }));
   }
 };
 
-const credential = new DefaultAzureCredential();
-const tokenManager = new TokenManager({
-  credential,
-  scope: config.scope,
-  refreshBufferMs: config.tokenRefreshBufferMs,
-  logger
-});
+const tokenManager = config.upstreamProvider === "azure"
+  ? new TokenManager({
+    credential: new DefaultAzureCredential(),
+    scope: config.scope,
+    refreshBufferMs: config.tokenRefreshBufferMs,
+    logger
+  })
+  : null;
 
 const server = createProxyServer({ config, tokenManager, logger });
 
@@ -29,8 +30,10 @@ server.listen(config.listenPort, config.listenHost, () => {
     {
       listenHost: config.listenHost,
       listenPort: config.listenPort,
+      upstreamProvider: config.upstreamProvider,
       upstreamBaseUrl: config.upstreamBaseUrl,
-      scope: config.scope
+      ...(config.upstreamProvider === "azure" ? { scope: config.scope } : {}),
+      stickyHighModels: config.stickyHighModels
     },
     "Codex proxy listening"
   );
